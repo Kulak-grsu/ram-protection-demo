@@ -1,0 +1,6 @@
+mode,interval_ms,checks,cpu_percent,working_set_kib,private_usage_kib
+baseline,0,0,0.0000,4288,652
+monitor,100,91,0.3125,4776,748
+monitor,250,38,0.0000,4768,692
+monitor,500,19,0.0000,4768,692
+monitor,1000,9,0.0000,4768,692

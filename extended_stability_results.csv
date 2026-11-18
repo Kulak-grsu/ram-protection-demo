@@ -1,0 +1,2 @@
+duration_minutes,region_mib,interval_ms,cpu_samples,checks,false_alarms,cpu_mean_percent,cpu_median_percent,cpu_stddev_percent,avg_hash_ms,working_set_kib
+120,32,500,7200,13255,0,6.1360,6.2004,1.3419,33.4177,37428

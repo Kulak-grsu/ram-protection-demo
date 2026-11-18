@@ -1,0 +1,5 @@
+condition,region_mib,interval_ms,duration_s,checks,cpu_mean_percent,cpu_median_percent,cpu_stddev_percent,avg_hash_ms,working_set_kib
+idle,32,50,15,161,35.2368,34.1360,3.0472,34.2923,37496
+idle,32,500,15,27,5.8848,6.1881,1.5070,34.0005,37516
+load,32,50,15,162,136.7651,135.1267,4.1604,34.5194,37520
+load,32,500,15,27,105.9051,106.3240,1.5075,35.7485,37500

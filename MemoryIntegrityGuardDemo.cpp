@@ -3,18 +3,23 @@
 
 #include <atomic>
 #include <array>
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #pragma comment(lib, "Psapi.lib")
 
@@ -57,6 +62,12 @@ public:
     bool IncidentDetected() const { return incidentDetected_; }
 
     std::uint64_t ChecksPerformed() const { return checksPerformed_.load(); }
+
+    double AverageHashTimeMs() const {
+        const auto checks = checksPerformed_.load();
+        return checks == 0 ? 0.0
+            : static_cast<double>(totalHashTimeUs_.load()) / 1000.0 / static_cast<double>(checks);
+    }
 
     bool WaitForIncident(std::chrono::milliseconds timeout) const {
         const auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -117,7 +128,11 @@ private:
                     continue;
                 }
             }
+            const auto hashStart = std::chrono::steady_clock::now();
             const auto currentHash = CalculateHash();
+            const auto hashTime = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - hashStart);
+            totalHashTimeUs_.fetch_add(static_cast<std::uint64_t>(hashTime.count()));
             checksPerformed_.fetch_add(1);
             if (currentHash != referenceHash_) {
                 incidentDetected_ = true;
@@ -136,6 +151,7 @@ private:
     std::atomic<bool> running_ = false;
     std::atomic<bool> incidentDetected_ = false;
     std::atomic<std::uint64_t> checksPerformed_ = 0;
+    std::atomic<std::uint64_t> totalHashTimeUs_ = 0;
     std::condition_variable wakeUp_;
     std::mutex waitMutex_;
     bool monitorProtection_ = false;
@@ -468,6 +484,269 @@ int RunStabilityTest() {
     return falseAlarms == 0 && totalChecks > 0 ? 0 : 2;
 }
 
+struct NumericSummary {
+    double mean = 0.0;
+    double median = 0.0;
+    double standardDeviation = 0.0;
+};
+
+NumericSummary Summarize(std::vector<double> values) {
+    if (values.empty()) {
+        return {};
+    }
+
+    const double sum = std::accumulate(values.begin(), values.end(), 0.0);
+    const double mean = sum / static_cast<double>(values.size());
+    std::sort(values.begin(), values.end());
+    const std::size_t middle = values.size() / 2;
+    const double median = values.size() % 2 == 0
+        ? (values[middle - 1] + values[middle]) / 2.0
+        : values[middle];
+    double squaredDeviationSum = 0.0;
+    for (const double value : values) {
+        const double deviation = value - mean;
+        squaredDeviationSum += deviation * deviation;
+    }
+    return { mean, median, std::sqrt(squaredDeviationSum / static_cast<double>(values.size())) };
+}
+
+struct ScenarioResult {
+    bool started = false;
+    bool incidentDetected = false;
+    std::uint64_t checks = 0;
+    double averageHashTimeMs = 0.0;
+    NumericSummary cpu;
+    std::size_t workingSetKib = 0;
+};
+
+ScenarioResult RunMeasuredScenario(std::size_t guardedRegionBytes,
+                                  std::chrono::milliseconds checkInterval,
+                                  std::chrono::seconds duration,
+                                  bool generateLoad) {
+    std::vector<std::uint8_t> guardedRegion(guardedRegionBytes, 0x42);
+    MemoryIntegrityGuard guard(guardedRegion.data(), guardedRegion.size(), checkInterval);
+    if (!guard.Start()) {
+        return {};
+    }
+
+    std::atomic<bool> keepBusy{ generateLoad };
+    std::atomic<std::uint64_t> workCounter{ 0 };
+    std::thread workload;
+    if (generateLoad) {
+        workload = std::thread([&keepBusy, &workCounter] {
+            std::vector<std::uint8_t> workingBuffer(64ull * 1024 * 1024, 1);
+            while (keepBusy.load(std::memory_order_relaxed)) {
+                for (std::size_t index = 0; index < workingBuffer.size(); index += 64) {
+                    workingBuffer[index] = static_cast<std::uint8_t>(workingBuffer[index] + 1);
+                }
+                workCounter.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+
+    std::vector<double> cpuSamples;
+    auto previous = CaptureProcessSnapshot();
+    const auto deadline = std::chrono::steady_clock::now() + duration;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto sampleStart = std::chrono::steady_clock::now();
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        const auto current = CaptureProcessSnapshot();
+        if (previous.has_value() && current.has_value()) {
+            const auto sampleDuration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - sampleStart);
+            cpuSamples.push_back(CalculateCpuPercent(*previous, *current, sampleDuration));
+        }
+        previous = current;
+    }
+
+    keepBusy = false;
+    if (workload.joinable()) {
+        workload.join();
+    }
+    guard.Stop();
+    const auto finalSnapshot = CaptureProcessSnapshot();
+
+    return {
+        true,
+        guard.IncidentDetected(),
+        guard.ChecksPerformed(),
+        guard.AverageHashTimeMs(),
+        Summarize(cpuSamples),
+        finalSnapshot.has_value() ? finalSnapshot->workingSetBytes / 1024 : 0
+    };
+}
+
+int RunExtendedStabilityTest(int minutes) {
+    if (minutes <= 0) {
+        std::cerr << "The duration for --extended-stability must be a positive number of minutes.\n";
+        return 1;
+    }
+
+    constexpr std::size_t regionMiB = 32;
+    constexpr auto interval = std::chrono::milliseconds(500);
+    const auto duration = std::chrono::seconds(minutes * 60);
+    std::cout << "Extended stability test: " << minutes
+        << " minute(s), 32 MiB region, 500 ms interval, no modification.\n";
+    const auto result = RunMeasuredScenario(regionMiB * 1024 * 1024, interval, duration, false);
+    if (!result.started) {
+        std::cerr << "Unable to start the extended stability test.\n";
+        return 1;
+    }
+
+    std::ofstream csv("extended_stability_results.csv");
+    csv << "duration_minutes,region_mib,interval_ms,cpu_samples,checks,false_alarms,cpu_mean_percent,cpu_median_percent,cpu_stddev_percent,avg_hash_ms,working_set_kib\n";
+    csv << minutes << ',' << regionMiB << ',' << interval.count() << ',' << minutes * 60 << ','
+        << result.checks << ',' << (result.incidentDetected ? 1 : 0) << ','
+        << std::fixed << std::setprecision(4) << result.cpu.mean << ',' << result.cpu.median << ','
+        << result.cpu.standardDeviation << ',' << result.averageHashTimeMs << ','
+        << result.workingSetKib << '\n';
+
+    std::cout << "Checks: " << result.checks << ", false alarms: "
+        << (result.incidentDetected ? 1 : 0) << ", CPU mean/median/stddev: "
+        << std::fixed << std::setprecision(4) << result.cpu.mean << "% / "
+        << result.cpu.median << "% / " << result.cpu.standardDeviation << "%\n";
+    std::cout << "Results saved to extended_stability_results.csv\n";
+    return result.incidentDetected ? 2 : 0;
+}
+
+int RunLoadTest() {
+    constexpr std::size_t regionMiB = 32;
+    constexpr auto duration = std::chrono::seconds(15);
+    const std::array intervals{ std::chrono::milliseconds(50), std::chrono::milliseconds(500) };
+    std::ofstream csv("load_test_results.csv");
+    csv << "condition,region_mib,interval_ms,duration_s,checks,cpu_mean_percent,cpu_median_percent,cpu_stddev_percent,avg_hash_ms,working_set_kib\n";
+
+    bool allStable = true;
+    for (const bool underLoad : { false, true }) {
+        for (const auto interval : intervals) {
+            std::cout << "Load test: " << (underLoad ? "active workload" : "idle")
+                << ", interval " << interval.count() << " ms...\n";
+            const auto result = RunMeasuredScenario(regionMiB * 1024 * 1024, interval, duration, underLoad);
+            if (!result.started) {
+                std::cerr << "Unable to start a load-test scenario.\n";
+                return 1;
+            }
+            csv << (underLoad ? "load" : "idle") << ',' << regionMiB << ',' << interval.count() << ','
+                << duration.count() << ',' << result.checks << ',' << std::fixed << std::setprecision(4)
+                << result.cpu.mean << ',' << result.cpu.median << ',' << result.cpu.standardDeviation << ','
+                << result.averageHashTimeMs << ',' << result.workingSetKib << '\n';
+            allStable = allStable && !result.incidentDetected;
+        }
+    }
+    std::cout << "Results saved to load_test_results.csv\n";
+    return allStable ? 0 : 2;
+}
+
+struct TransientTestResult {
+    bool detected = false;
+};
+
+TransientTestResult RunTransientSelfTest(std::chrono::milliseconds interval,
+                                         std::chrono::milliseconds delay,
+                                         std::chrono::milliseconds pulse) {
+    std::array<std::atomic<std::uint8_t>, 64> testRegion{};
+    testRegion[0] = 0x42;
+    MemoryIntegrityGuard guard(testRegion.data(), testRegion.size(), interval);
+    if (!guard.Start()) {
+        return {};
+    }
+    std::this_thread::sleep_for(delay);
+    testRegion[0] = 0x99;
+    std::this_thread::sleep_for(pulse);
+    testRegion[0] = 0x42;
+    std::this_thread::sleep_for(interval + std::chrono::milliseconds(100));
+    guard.Stop();
+    return { guard.IncidentDetected() };
+}
+
+int RunToctouTest() {
+    const std::array intervals{
+        std::chrono::milliseconds(50), std::chrono::milliseconds(100),
+        std::chrono::milliseconds(250), std::chrono::milliseconds(500)
+    };
+    constexpr int trialsPerInterval = 20;
+    std::ofstream csv("toctou_results.csv");
+    csv << "interval_ms,pulse_ms,trial,detected\n";
+
+    for (const auto interval : intervals) {
+        const auto pulse = std::chrono::milliseconds((std::max)(5LL, interval.count() / 4));
+        int detectedCount = 0;
+        for (int trial = 1; trial <= trialsPerInterval; ++trial) {
+            const auto delay = std::chrono::milliseconds((std::max)(1LL,
+                (interval.count() * trial) / (trialsPerInterval + 1)));
+            const auto result = RunTransientSelfTest(interval, delay, pulse);
+            csv << interval.count() << ',' << pulse.count() << ',' << trial << ','
+                << (result.detected ? 1 : 0) << '\n';
+            detectedCount += result.detected ? 1 : 0;
+        }
+        std::cout << "TOCTOU test, interval " << interval.count() << " ms, pulse "
+            << pulse.count() << " ms: detected " << detectedCount << " of "
+            << trialsPerInterval << " transient changes.\n";
+    }
+    std::cout << "Results saved to toctou_results.csv\n";
+    return 0;
+}
+
+int RunScalabilityTest() {
+    const std::array<std::size_t, 3> regionMiB{ 1, 100, 1024 };
+    const std::array intervals{
+        std::chrono::milliseconds(50), std::chrono::milliseconds(100),
+        std::chrono::milliseconds(250), std::chrono::milliseconds(500)
+    };
+    constexpr auto duration = std::chrono::seconds(3);
+    std::ofstream csv("scalability_results.csv");
+    csv << "region_mib,interval_ms,status,checks,cpu_percent,avg_hash_ms,working_set_kib\n";
+
+    MEMORYSTATUSEX memoryStatus{};
+    memoryStatus.dwLength = sizeof(memoryStatus);
+    GlobalMemoryStatusEx(&memoryStatus);
+
+    for (const auto sizeMiB : regionMiB) {
+        const auto sizeBytes = sizeMiB * 1024ull * 1024ull;
+        if (memoryStatus.ullAvailPhys < sizeBytes * 2) {
+            for (const auto interval : intervals) {
+                csv << sizeMiB << ',' << interval.count() << ",skipped_low_memory,0,0,0,0\n";
+            }
+            std::cout << "Scalability test: " << sizeMiB << " MiB skipped because free memory is insufficient.\n";
+            continue;
+        }
+
+        try {
+            std::vector<std::uint8_t> region(sizeBytes, 0x42);
+            for (const auto interval : intervals) {
+                MemoryIntegrityGuard guard(region.data(), region.size(), interval);
+                const auto before = CaptureProcessSnapshot();
+                if (!before.has_value() || !guard.Start()) {
+                    std::cerr << "Unable to start a scalability measurement.\n";
+                    return 1;
+                }
+                std::this_thread::sleep_for(duration);
+                guard.Stop();
+                const auto after = CaptureProcessSnapshot();
+                if (!after.has_value()) {
+                    std::cerr << "Unable to read process metrics.\n";
+                    return 1;
+                }
+                const double cpuPercent = CalculateCpuPercent(*before, *after,
+                    std::chrono::duration_cast<std::chrono::milliseconds>(duration));
+                csv << sizeMiB << ',' << interval.count() << ",completed," << guard.ChecksPerformed()
+                    << ',' << std::fixed << std::setprecision(4) << cpuPercent << ','
+                    << guard.AverageHashTimeMs() << ',' << after->workingSetBytes / 1024 << '\n';
+                std::cout << "Scalability: " << sizeMiB << " MiB, " << interval.count()
+                    << " ms, checks " << guard.ChecksPerformed() << ", CPU " << cpuPercent
+                    << "%, average hash time " << guard.AverageHashTimeMs() << " ms.\n";
+            }
+        } catch (const std::bad_alloc&) {
+            for (const auto interval : intervals) {
+                csv << sizeMiB << ',' << interval.count() << ",allocation_failed,0,0,0,0\n";
+            }
+            std::cout << "Scalability test: allocation failed for " << sizeMiB << " MiB.\n";
+        }
+    }
+    std::cout << "Results saved to scalability_results.csv\n";
+    return 0;
+}
+
 int main(int argc, char* argv[]) {
     const std::string_view mode = argc == 2 ? argv[1] : "";
     const bool normalRun = mode == "--normal";
@@ -476,8 +755,17 @@ int main(int argc, char* argv[]) {
     const bool moduleCheckRun = mode == "--module-check";
     const bool protectionSelfTestRun = mode == "--protection-self-test";
     const bool performanceRun = mode == "--performance";
-    if (argc > 1 && !normalRun && !benchmarkRun && !stabilityRun && !moduleCheckRun && !protectionSelfTestRun && !performanceRun) {
-        std::cerr << "Usage: ProtectedDemo.exe [--normal | --benchmark | --stability | --module-check | --protection-self-test | --performance]\n";
+    const bool loadTestRun = mode == "--load-test";
+    const bool toctouRun = mode == "--toctou";
+    const bool scalabilityRun = mode == "--scalability";
+    const bool extendedStabilityRun = argc >= 2 && std::string_view(argv[1]) == "--extended-stability";
+    if ((argc > 2 && !extendedStabilityRun) ||
+        (argc > 1 && !normalRun && !benchmarkRun && !stabilityRun && !moduleCheckRun &&
+         !protectionSelfTestRun && !performanceRun && !loadTestRun && !toctouRun &&
+         !scalabilityRun && !extendedStabilityRun)) {
+        std::cerr << "Usage: ProtectedDemo.exe [--normal | --benchmark | --stability | --module-check | "
+            "--protection-self-test | --performance | --load-test | --toctou | --scalability | "
+            "--extended-stability <minutes>]\n";
         return 1;
     }
 
@@ -495,6 +783,19 @@ int main(int argc, char* argv[]) {
     }
     if (performanceRun) {
         return RunPerformanceTest();
+    }
+    if (loadTestRun) {
+        return RunLoadTest();
+    }
+    if (toctouRun) {
+        return RunToctouTest();
+    }
+    if (scalabilityRun) {
+        return RunScalabilityTest();
+    }
+    if (extendedStabilityRun) {
+        const int minutes = argc == 3 ? std::atoi(argv[2]) : 60;
+        return RunExtendedStabilityTest(minutes);
     }
 
     constexpr auto checkInterval = std::chrono::milliseconds(1000);
